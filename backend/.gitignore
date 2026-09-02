@@ -1,0 +1,29 @@
+venv
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+*.env
+
+# Byte-compiled / optimized / DLL files
+*.pyo
+*.pyd
+
+# Distribution / packaging
+dist/
+build/
+
+# Testing / coverage
+.coverage
+htmlcov/
+.pytest_cache/
