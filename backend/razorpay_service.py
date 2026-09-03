@@ -138,3 +138,22 @@ def _mock_payment_link(order_id: str) -> str:
 def is_mock_mode() -> bool:
     """Expose mock-mode flag for health-check endpoints."""
     return _MOCK_MODE
+
+
+def create_payment_link(
+    order_id: str,
+    amount_paise: int,
+    name: str = "",
+    phone: str = "",
+    email: str = "customer@example.com",
+    description: str = "",
+    notes: dict | None = None
+) -> str:
+    return create_recovery_payment_link(
+        order_id=order_id,
+        amount_paise=amount_paise,
+        customer_name=name,
+        phone=phone,
+        email=email,
+        notes=notes
+    )

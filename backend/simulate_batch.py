@@ -1,260 +1,269 @@
-import sys, time, json
-try:
-    import httpx
-except ImportError:
-    print('ERROR: httpx not installed. Run: pip install httpx')
+"""
+simulate_batch.py -- 10-scenario end-to-end batch simulation.
+
+v4: Includes full auth flow:
+  1. Auto-registers (or skips if email exists) a test admin.
+  2. Logs in and obtains JWT access token.
+  3. Passes Bearer token in all webhook requests.
+  4. Resets audit log before each run.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+import httpx
+
+# ---------------------------------------------------------------------------
+# Target server auto-discovery
+# ---------------------------------------------------------------------------
+PORTS = [8001, 8000]
+BASE_URL: str | None = None
+
+for _port in PORTS:
+    try:
+        r = httpx.get(f"http://127.0.0.1:{_port}/health", timeout=2)
+        if r.status_code == 200:
+            BASE_URL = f"http://127.0.0.1:{_port}"
+            break
+    except Exception:
+        pass
+
+if not BASE_URL:
+    print("\n  ❌  No server found on ports 8000 or 8001. Start uvicorn first.\n")
     sys.exit(1)
 
-BASE_URL = 'http://127.0.0.1:8000'
+# ---------------------------------------------------------------------------
+# Auth: register + login to get Bearer token
+# ---------------------------------------------------------------------------
+TEST_EMAIL = "simtest@razorpay-sim.dev"
+TEST_PASSWORD = "SimTest@2026!"
+TEST_BUSINESS = "Simulation Test Merchant"
 
-TEST_EVENTS = [
+def get_auth_token() -> str:
+    """Register (ignore 409) then login and return Bearer token."""
+    with httpx.Client(base_url=BASE_URL, timeout=15) as client:
+        # Try to register
+        client.post("/auth/register", json={
+            "email": TEST_EMAIL,
+            "password": TEST_PASSWORD,
+            "business_name": TEST_BUSINESS,
+        })
+        # Login
+        resp = client.post("/auth/login", json={
+            "email": TEST_EMAIL,
+            "password": TEST_PASSWORD,
+        })
+        if resp.status_code != 200:
+            print(f"  [ERROR] Login failed ({resp.status_code}): {resp.text}")
+            sys.exit(1)
+        return resp.json()["access_token"]
+
+# ---------------------------------------------------------------------------
+# Test scenarios
+# ---------------------------------------------------------------------------
+SCENARIOS = [
     {
-        'order_id': 'order_FLIGHT001',
-        'payment_id': 'pay_FLIGHT001a',
-        'amount': 1250000,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_TIMED_OUT',
-        'error_description': 'Payment gateway timed out; no response from issuer bank.',
-        'customer_name': 'Arjun Mehra',
-        'customer_phone': '+919876543210',
-        'customer_email': 'arjun.mehra@gmail.com',
-        'customer_tier': 'VIP',
-        'attempts_made': 0,
-        'is_mandate': False,
+        "order_id": "order_FLIGHT001",
+        "payment_id": "pay_FLIGHT001a",
+        "amount": 1_250_000,
+        "error_code": "BAD_REQUEST_PAYMENT_TIMED_OUT",
+        "error_description": "Payment gateway timed out.",
+        "customer_name": "Arjun Mehra",
+        "customer_phone": "+919876543210",
+        "customer_tier": "VIP",
+        "attempts_made": 0,
     },
     {
-        'order_id': 'order_GROC002',
-        'payment_id': 'pay_GROC002a',
-        'amount': 73500,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_CARD_INSUFFICIENT_FUNDS',
-        'error_description': 'Card declined due to insufficient balance.',
-        'customer_name': 'Sunita Rao',
-        'customer_phone': '+918765432109',
-        'customer_email': 'sunita.rao@yahoo.in',
-        'customer_tier': 'STANDARD',
-        'attempts_made': 0,
-        'is_mandate': False,
+        "order_id": "order_GROC002",
+        "payment_id": "pay_GROC002a",
+        "amount": 73_500,
+        "error_code": "BAD_REQUEST_PAYMENT_CARD_INSUFFICIENT_FUNDS",
+        "error_description": "Insufficient funds in account.",
+        "customer_name": "Priya Sharma",
+        "customer_phone": "+919876543211",
+        "customer_tier": "STANDARD",
+        "attempts_made": 0,
     },
     {
-        'order_id': 'order_FASH003',
-        'payment_id': 'pay_FASH003a',
-        'amount': 349900,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_OTP_EXPIRED',
-        'error_description': 'Customer did not complete OTP verification within the time limit.',
-        'customer_name': 'Priya Sharma',
-        'customer_phone': '+917654321098',
-        'customer_email': 'priya.sharma@hotmail.com',
-        'customer_tier': 'REPEAT_DROPOFF',
-        'attempts_made': 1,
-        'is_mandate': False,
+        "order_id": "order_FASH003",
+        "payment_id": "pay_FASH003a",
+        "amount": 349_900,
+        "error_code": "BAD_REQUEST_PAYMENT_OTP_EXPIRED",
+        "error_description": "OTP expired during 3DS authentication.",
+        "customer_name": "Rahul Khanna",
+        "customer_phone": "+919876543212",
+        "customer_tier": "REPEAT_DROPOFF",
+        "attempts_made": 0,
     },
     {
-        'order_id': 'order_MAXR004',
-        'payment_id': 'pay_MAXR004a',
-        'amount': 89900,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_CARD_INSUFFICIENT_FUNDS',
-        'error_description': 'Repeated insufficient funds - third attempt.',
-        'customer_name': 'Ravi Kumar',
-        'customer_phone': '+916543210987',
-        'customer_email': 'ravi.kumar@outlook.com',
-        'customer_tier': 'STANDARD',
-        'attempts_made': 3,
-        'is_mandate': False,
+        "order_id": "order_MAXR004",
+        "payment_id": "pay_MAXR004a",
+        "amount": 89_900,
+        "error_code": "BAD_REQUEST_PAYMENT_CARD_INSUFFICIENT_FUNDS",
+        "error_description": "Insufficient funds — 3rd attempt.",
+        "customer_name": "Sunita Patel",
+        "customer_phone": "+919876543213",
+        "customer_tier": "STANDARD",
+        "attempts_made": 3,
     },
     {
-        'order_id': 'order_JEWL005',
-        'payment_id': 'pay_JEWL005a',
-        'amount': 7500000,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_OTP_EXPIRED',
-        'error_description': '3DS authentication session expired during high-value checkout.',
-        'customer_name': 'Deepa Nair',
-        'customer_phone': '+915432109876',
-        'customer_email': 'deepa.nair@gmail.com',
-        'customer_tier': 'VIP',
-        'attempts_made': 0,
-        'is_mandate': False,
+        "order_id": "order_JEWL005",
+        "payment_id": "pay_JEWL005a",
+        "amount": 7_500_000,
+        "error_code": "BAD_REQUEST_PAYMENT_OTP_EXPIRED",
+        "error_description": "High-value jewellery purchase — OTP expired.",
+        "customer_name": "Vikram Nair",
+        "customer_phone": "+919876543214",
+        "customer_tier": "VIP",
+        "attempts_made": 0,
     },
     {
-        'order_id': 'order_RISK006',
-        'payment_id': 'pay_RISK006a',
-        'amount': 450000,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_POSSIBLE_FRAUD',
-        'error_description': 'Transaction flagged by Razorpay Shield - velocity anomaly detected.',
-        'customer_name': 'Vikram Singh',
-        'customer_phone': '+914321098765',
-        'customer_email': 'vikram.singh@company.in',
-        'customer_tier': 'STANDARD',
-        'attempts_made': 0,
-        'is_mandate': False,
+        "order_id": "order_RISK006",
+        "payment_id": "pay_RISK006a",
+        "amount": 539_900,
+        "error_code": "BAD_REQUEST_PAYMENT_POSSIBLE_FRAUD",
+        "error_description": "Fraud risk flag triggered.",
+        "customer_name": "Unknown Customer",
+        "customer_phone": "+919876543215",
+        "customer_tier": "STANDARD",
+        "attempts_made": 1,
     },
     {
-        'order_id': 'order_BANK007',
-        'payment_id': 'pay_BANK007a',
-        'amount': 999900,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_BANK_SYSTEM_ERROR',
-        'error_description': 'HDFC Bank core banking system returned 503 - intermittent outage.',
-        'customer_name': 'Kavitha Reddy',
-        'customer_phone': '+913210987654',
-        'customer_email': 'kavitha.reddy@hdfc.co.in',
-        'customer_tier': 'VIP',
-        'attempts_made': 1,
-        'is_mandate': False,
+        "order_id": "order_BANK007",
+        "payment_id": "pay_BANK007a",
+        "amount": 999_900,
+        "error_code": "GATEWAY_ERROR_BANK_SYSTEM_ERROR",
+        "error_description": "Issuer bank 503 outage.",
+        "customer_name": "Amit Desai",
+        "customer_phone": "+919876543216",
+        "customer_tier": "STANDARD",
+        "attempts_made": 0,
     },
     {
-        'order_id': 'order_NACH008',
-        'payment_id': 'pay_NACH008a',
-        'amount': 500000,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_CARD_INSUFFICIENT_FUNDS',
-        'error_description': 'Auto-debit rejected: insufficient balance in mandate account.',
-        'customer_name': 'Anand Krishnan',
-        'customer_phone': '+912109876543',
-        'customer_email': 'anand.krishnan@gmail.com',
-        'customer_tier': 'REPEAT_DROPOFF',
-        'attempts_made': 0,
-        'is_mandate': True,
+        "order_id": "order_NACH008",
+        "payment_id": "pay_NACH008a",
+        "amount": 500_000,
+        "error_code": "BAD_REQUEST_PAYMENT_CARD_INSUFFICIENT_FUNDS",
+        "error_description": "e-NACH debit mandate bounce.",
+        "customer_name": "Deepa Reddy",
+        "customer_phone": "+919876543217",
+        "customer_tier": "STANDARD",
+        "attempts_made": 0,
     },
     {
-        'order_id': 'order_EDTC009',
-        'payment_id': 'pay_EDTC009a',
-        'amount': 199900,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_TIMED_OUT',
-        'error_description': 'UPI collect request timed out - payer did not respond.',
-        'customer_name': 'Neha Gupta',
-        'customer_phone': '+911098765432',
-        'customer_email': 'neha.gupta@college.edu.in',
-        'customer_tier': 'STANDARD',
-        'attempts_made': 0,
-        'is_mandate': False,
+        "order_id": "order_EDTC009",
+        "payment_id": "pay_EDTC009a",
+        "amount": 199_900,
+        "error_code": "BAD_REQUEST_PAYMENT_TIMED_OUT",
+        "error_description": "UPI collect request timed out.",
+        "customer_name": "Ravi Kumar",
+        "customer_phone": "+919876543218",
+        "customer_tier": "STANDARD",
+        "attempts_made": 1,
     },
     {
-        'order_id': 'order_HOTL010',
-        'payment_id': 'pay_HOTL010a',
-        'amount': 2200000,
-        'currency': 'INR',
-        'error_code': 'BAD_REQUEST_PAYMENT_CARD_HOLDER_AUTHENTICATION_FAILED',
-        'error_description': '3DS card-holder authentication failed on second attempt.',
-        'customer_name': 'Rajesh Patel',
-        'customer_phone': '+910987654321',
-        'customer_email': 'rajesh.patel@vip.travel.in',
-        'customer_tier': 'VIP',
-        'attempts_made': 1,
-        'is_mandate': False,
+        "order_id": "order_HOTL010",
+        "payment_id": "pay_HOTL010a",
+        "amount": 2_200_000,
+        "error_code": "BAD_REQUEST_PAYMENT_CARD_HOLDER_AUTHENTICATION_FAILED",
+        "error_description": "Card holder authentication failed.",
+        "customer_name": "Sneha Iyer",
+        "customer_phone": "+919876543219",
+        "customer_tier": "VIP",
+        "attempts_made": 0,
     },
 ]
 
-COL_W = [14, 35, 28, 10, 14, 26]
-HEADERS = ['Order ID', 'Error Code', 'AI Decision', 'Guardrail?', 'Recovered', 'Status']
-
-def _sep():
-    return '-+-'.join('-' * w for w in COL_W)
-
-def _row(cells):
-    parts = []
-    for cell, w in zip(cells, COL_W):
-        cell = str(cell)
-        parts.append((cell[:w] if len(cell) > w else cell).ljust(w))
-    return ' ' + ' | '.join(parts) + ' '
-
-def paise_to_inr(p):
-    return 'Rs.{:,.0f}'.format(p / 100)
-
-def run():
+# ---------------------------------------------------------------------------
+# Run simulation
+# ---------------------------------------------------------------------------
+def main():
     print()
-    print('=' * 80)
-    print('  RAZORPAY AI REVENUE RECOVERY ENGINE -- BATCH SIMULATION (10 SCENARIOS)')
-    print('=' * 80)
+    print("=" * 80)
+    print("  RAZORPAY AI REVENUE RECOVERY ENGINE -- BATCH SIMULATION (10 SCENARIOS)")
+    print("=" * 80)
+    print(f"\n  Target : {BASE_URL}")
+    print(f"  Count  : {len(SCENARIOS)}\n")
+
+    # Auth
+    print("  Authenticating...", end=" ", flush=True)
+    token = get_auth_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    print("[OK] Token obtained.\n")
+
+    # Reset audit log
+    with httpx.Client(base_url=BASE_URL, headers=headers, timeout=15) as client:
+        client.post("/audit/reset")
+
+    col_w = [15, 37, 30, 12, 16, 28]
+    sep = "  " + "-" * col_w[0] + "+" + "-" * col_w[1] + "+" + "-" * col_w[2] + "+" + "-" * col_w[3] + "+" + "-" * col_w[4] + "+" + "-" * col_w[5]
+
+    print(sep)
+    print(
+        f"  {'Order ID':<{col_w[0]}}| {'Error Code':<{col_w[1]}}| {'AI Decision':<{col_w[2]}}| {'Guardrail?':<{col_w[3]}}| {'Recovered':<{col_w[4]}}| {'Status':<{col_w[5]}}"
+    )
+    print(sep)
+
+    with httpx.Client(base_url=BASE_URL, headers=headers, timeout=60) as client:
+        for scenario in SCENARIOS:
+            resp = client.post("/webhook/payment-failed", json=scenario)
+            short_order = scenario["order_id"].replace("order_", "")
+
+            if resp.status_code == 409:
+                print(f"  {short_order:<{col_w[0]}}| {scenario['error_code'][:col_w[1]-1]:<{col_w[1]}}| {'N/A(dup)':<{col_w[2]}}| {'no':<{col_w[3]}}| {'--':<{col_w[4]}}| DUPLICATE")
+                continue
+
+            if resp.status_code not in (200, 201):
+                print(f"  {short_order:<{col_w[0]}}| {scenario['error_code'][:col_w[1]-1]:<{col_w[1]}}| {'ERROR':<{col_w[2]}}| {'--':<{col_w[3]}}| {'--':<{col_w[4]}}| HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            strategy = data.get("ai_strategy", "?")[:col_w[2]-1]
+            guardrail = "yes" if data.get("guardrail_overridden") else "no"
+            recovered = f"Rs.{data['original_amount']//100:,}" if data.get("status") == "RECOVERED_PENDING_PAYMENT" else "--"
+            status_val = data.get("status", "?")
+
+            print(f"  {short_order:<{col_w[0]}}| {scenario['error_code'][:col_w[1]-1]:<{col_w[1]}}| {strategy:<{col_w[2]}}| {guardrail:<{col_w[3]}}| {recovered:<{col_w[4]}}| {status_val:<{col_w[5]}}")
+            time.sleep(0.3)  # brief pause between requests
+
+    print(sep)
+
+    # Fetch final metrics
+    print("\n  Fetching metrics...\n")
+    with httpx.Client(base_url=BASE_URL, headers=headers, timeout=15) as client:
+        m_resp = client.get("/audit/metrics")
+
+    if m_resp.status_code != 200:
+        print(f"  ⚠  Could not fetch metrics: HTTP {m_resp.status_code}")
+        return
+
+    m = m_resp.json()
+    total_at_risk = m.get("total_gmv_at_risk_inr", 0)
+    recovered = m.get("total_gmv_recovered_inr", 0)
+    scheduled = m.get("total_gmv_scheduled_inr", 0)
+    aborted = m.get("total_gmv_aborted_inr", 0)
+    overrides = m.get("guardrail_override_count", 0)
+    rate = m.get("recovery_success_rate_pct", 0)
+
+    net_recovery_pct = round(((recovered + scheduled) / total_at_risk * 100), 1) if total_at_risk else 0.0
+
+    print("=" * 80)
+    print("  FINAL METRICS SUMMARY")
+    print("=" * 80)
+    print(f"  Total Events Processed      : {m.get('total_events_processed', 0)}")
+    print(f"  Total GMV At Risk           : Rs.{total_at_risk:,.2f}")
+    print(f"  GMV Under Active Recovery   : Rs.{recovered:,.2f}  (payment links sent)")
+    print(f"  GMV Queued for Silent Retry : Rs.{scheduled:,.2f}  (background retry)")
+    print(f"  GMV Aborted (Manual Review) : Rs.{aborted:,.2f}")
+    print(f"  Guardrail Overrides         : {overrides}")
+    print(f"  Net Recovery Rate           : {rate}%")
     print()
-    print('  Target : ' + BASE_URL)
-    print('  Count  : ' + str(len(TEST_EVENTS)))
-    print()
-    sep = _sep()
-    print('  ' + sep)
-    print('  ' + _row(HEADERS))
-    print('  ' + sep)
-
-    results = []
-    client = httpx.Client(timeout=60.0)
-
-    for payload in TEST_EVENTS:
-        oid = payload['order_id']
-        ecode = payload['error_code']
-        amt = payload['amount']
-        try:
-            r = client.post(BASE_URL + '/webhook/payment-failed', json=payload)
-            if r.status_code == 409:
-                rd = {'order_id': oid, 'ai_strategy': 'N/A(dup)', 'guardrail_overridden': False,
-                      'payment_link_url': None, 'status': 'DUPLICATE', 'original_amount': amt}
-            elif r.status_code == 200:
-                rd = r.json()
-            else:
-                rd = {'order_id': oid, 'ai_strategy': 'ERR', 'guardrail_overridden': False,
-                      'payment_link_url': None, 'status': 'HTTP_' + str(r.status_code),
-                      'original_amount': amt}
-        except httpx.ConnectError:
-            print()
-            print('  [ERROR] Cannot connect to ' + BASE_URL + '. Is the server running?')
-            sys.exit(1)
-        except Exception as e:
-            rd = {'order_id': oid, 'ai_strategy': 'EXC', 'guardrail_overridden': False,
-                  'payment_link_url': None, 'status': 'ERROR', 'original_amount': amt}
-
-        results.append(rd)
-        status = rd.get('status', 'UNKNOWN')
-        guard = 'YES' if rd.get('guardrail_overridden') else 'no'
-        rec = paise_to_inr(amt) if status == 'RECOVERED_PENDING_PAYMENT' else '--'
-        short_err = ecode.replace('BAD_REQUEST_PAYMENT_', '').replace('BAD_REQUEST_', '')
-        ai_dec = rd.get('ai_strategy', '--')
-        print('  ' + _row([oid.replace('order_', ''), short_err, ai_dec, guard, rec, status]))
-        time.sleep(0.4)
-
-    print('  ' + sep)
-    client.close()
-
-    print()
-    print('  Fetching metrics...')
-    try:
-        mr = httpx.get(BASE_URL + '/audit/metrics', timeout=10.0)
-        m = mr.json()
-    except Exception as e:
-        m = {'error': str(e)}
-
-    print()
-    print('=' * 80)
-    print('  FINAL METRICS SUMMARY')
-    print('=' * 80)
-
-    if 'error' not in m:
-        at_risk   = m.get('total_gmv_at_risk_inr', 0)
-        recovered = m.get('total_gmv_recovered_inr', 0)
-        scheduled = m.get('total_gmv_scheduled_inr', 0)
-        aborted   = m.get('total_gmv_aborted_inr', 0)
-        overrides = m.get('guardrail_override_count', 0)
-        rate      = m.get('recovery_success_rate_pct', 0.0)
-        total     = m.get('total_events_processed', 0)
-
-        print('  Total Events Processed      : ' + str(total))
-        print('  Total GMV At Risk           : Rs.' + '{:,.2f}'.format(at_risk))
-        print('  GMV Under Active Recovery   : Rs.' + '{:,.2f}'.format(recovered) + '  (payment links sent)')
-        print('  GMV Queued for Silent Retry : Rs.' + '{:,.2f}'.format(scheduled) + '  (background retry)')
-        print('  GMV Aborted (Manual Review) : Rs.' + '{:,.2f}'.format(aborted))
-        print('  Guardrail Overrides         : ' + str(overrides))
-        print('  Net Recovery Rate           : ' + str(rate) + '%')
-        print()
-        if at_risk > 0:
-            net_pct = round((recovered + scheduled) / at_risk * 100, 1)
-            print('  *** NET GMV RECOVERY: {:.1f}% of Rs.{:,.2f} at risk ***'.format(net_pct, at_risk))
-    else:
-        print('  Could not fetch metrics: ' + m['error'])
-
-    print('=' * 80)
+    print(f"  *** NET GMV RECOVERY: {net_recovery_pct}% of Rs.{total_at_risk:,.2f} at risk ***")
+    print("=" * 80)
     print()
 
-run()
+
+if __name__ == "__main__":
+    main()

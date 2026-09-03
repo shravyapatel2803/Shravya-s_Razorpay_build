@@ -1,592 +1,522 @@
-﻿"""
-database.py (v2) - SQLite audit ledger for the Autonomous Payment Recovery & Dunning Orchestrator.
-
-Adds:
-  - retry_at / retry_count columns on recovery_audit_log (scheduler support)
-  - notification_sent / notification_channel columns (notifications support)
-  - recovery_notifications table (per-message delivery receipts)
-  - get_pending_retries()    -- scheduler polling
-  - mark_retry_dispatched()  -- scheduler state update
-  - log_notification()       -- notification receipt
-  - get_notification_stats() -- rate-limit helper
-  - Analytics query helpers used by analytics.py
 """
+database.py — SQLAlchemy 2.0 ORM with PostgreSQL / SQLite support.
 
+Tables:
+  merchants    — legacy compatibility alias for User (kept for existing code)
+  users        — full merchant auth accounts
+  api_keys     — per-merchant programmatic API keys
+  refresh_tokens — JWT refresh token store (rotated on use)
+  recovery_audit_log — complete decision ledger
+"""
 from __future__ import annotations
 
-import datetime
-import sqlite3
-from contextlib import contextmanager
-from typing import Generator
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from uuid import uuid4
 
-from models import FailedPaymentEvent, paise_to_rupees
+from sqlalchemy import (
+    Boolean, Column, DateTime, Enum, ForeignKey, Index,
+    Integer, String, Text, UniqueConstraint, func, create_engine,
+)
+from sqlalchemy.dialects.sqlite import TEXT as SQLITE_TEXT
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-DB_PATH = "recovery_audit.db"
+from models import FailedPaymentEvent, paise_to_rupees as paise_to_inr
+
+# ---------------------------------------------------------------------------
+# Engine setup
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///recovery_audit.db")
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+is_sqlite = "sqlite" in DATABASE_URL
+
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=not is_sqlite,
+    connect_args={"check_same_thread": False} if is_sqlite else {},
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 
 # ---------------------------------------------------------------------------
-# Connection management
+# User (Merchant) Auth Table
 # ---------------------------------------------------------------------------
+class User(Base):
+    __tablename__ = "users"
 
-@contextmanager
-def _get_conn() -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    email = Column(String(120), unique=True, nullable=False, index=True)
+    hashed_password = Column(String(200), nullable=False)
+    business_name = Column(String(100), nullable=False, default="My Store")
+    role = Column(
+        Enum("ADMIN", "ANALYST", "VIEWER", name="user_role"),
+        nullable=False,
+        default="ADMIN",
+    )
+    is_active = Column(Boolean, default=True)
+
+    # Merchant credentials (stored per-tenant)
+    razorpay_key_id = Column(String(100), nullable=True)
+    razorpay_key_secret = Column(String(100), nullable=True)
+    gemini_api_key = Column(String(150), nullable=True)
+    webhook_secret = Column(String(100), nullable=False, default=lambda: secrets.token_hex(32))
+    auto_recovery_enabled = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+    # Parent FK for sub-users (ANALYST/VIEWER belong to an ADMIN)
+    parent_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+
+    api_keys = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
+    refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
+    recovery_logs = relationship("RecoveryAuditLog", back_populates="user",
+                                 foreign_keys="RecoveryAuditLog.merchant_id")
+
+
+# Alias for legacy code compatibility
+Merchant = User
 
 
 # ---------------------------------------------------------------------------
-# Schema bootstrap  (safe to call multiple times -- uses IF NOT EXISTS)
+# API Keys Table
 # ---------------------------------------------------------------------------
+class ApiKey(Base):
+    __tablename__ = "api_keys"
 
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    label = Column(String(80), nullable=False)
+    key_prefix = Column(String(16), nullable=False)  # First 16 chars (display only)
+    key_hash = Column(String(64), nullable=False, unique=True)  # SHA-256 of raw key
+    is_active = Column(Boolean, default=True)
+    last_used_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="api_keys")
+
+    __table_args__ = (
+        Index("ix_api_key_hash", "key_hash"),
+        Index("ix_api_key_user_active", "user_id", "is_active"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Refresh Tokens Table (JWT rotation)
+# ---------------------------------------------------------------------------
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    revoked = Column(Boolean, default=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="refresh_tokens")
+
+    __table_args__ = (
+        Index("ix_refresh_token_hash", "token_hash"),
+        Index("ix_refresh_user_id", "user_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Recovery Audit Log
+# ---------------------------------------------------------------------------
+class RecoveryAuditLog(Base):
+    __tablename__ = "recovery_audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    merchant_id = Column(String(36), ForeignKey("users.id"), nullable=False, default="system")
+    order_id = Column(String(100), nullable=False, index=True)
+    payment_id = Column(String(100), nullable=True)
+    amount_paise = Column(Integer, nullable=False)
+    error_code = Column(String(100), nullable=False)
+    customer_name = Column(String(100), nullable=True)
+    customer_phone = Column(String(50), nullable=True)
+    customer_tier = Column(String(30), default="STANDARD")
+    attempts = Column(Integer, default=0)
+
+    ai_strategy = Column(String(50), nullable=False)
+    final_action = Column(Text, nullable=False)
+    guardrail_override = Column(Boolean, default=False)
+    override_reason = Column(Text, nullable=True)
+    status = Column(String(50), nullable=False)
+
+    payment_link = Column(Text, nullable=True)
+    nudge_message_sent = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="recovery_logs",
+                        foreign_keys=[merchant_id])
+
+    __table_args__ = (
+        Index("ix_merchant_order_idx", "merchant_id", "order_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Database Initialization
+# ---------------------------------------------------------------------------
 def init_db() -> None:
-    with _get_conn() as conn:
-        # Main audit table -- new columns added with ALTER TABLE if missing
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS recovery_audit_log (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id            TEXT    NOT NULL,
-                payment_id          TEXT    NOT NULL DEFAULT '',
-                amount_paise        INTEGER NOT NULL,
-                error_code          TEXT    NOT NULL,
-                customer_tier       TEXT    NOT NULL DEFAULT 'STANDARD',
-                customer_phone      TEXT    NOT NULL DEFAULT '',
-                customer_name       TEXT    NOT NULL DEFAULT '',
-                customer_email      TEXT    NOT NULL DEFAULT '',
-                attempts            INTEGER NOT NULL DEFAULT 0,
-                ai_strategy         TEXT    NOT NULL,
-                final_action        TEXT    NOT NULL,
-                guardrail_override  INTEGER NOT NULL DEFAULT 0,
-                override_reason     TEXT,
-                payment_link_url    TEXT,
-                status              TEXT    NOT NULL,
-                -- scheduler columns
-                retry_at            TEXT,
-                retry_count         INTEGER NOT NULL DEFAULT 0,
-                cooldown_seconds    INTEGER NOT NULL DEFAULT 0,
-                -- notification columns
-                notification_sent   INTEGER NOT NULL DEFAULT 0,
-                notification_channel TEXT,
-                notification_status TEXT,
-                created_at          TEXT    NOT NULL
+    """Create all tables and seed a default ADMIN user if none exists."""
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        # Only seed if the table is empty
+        if db.query(User).count() == 0:
+            from security import hash_password
+            default_admin = User(
+                id="default_merchant",
+                email=os.getenv("DEFAULT_ADMIN_EMAIL", "admin@razorpay-recovery.local"),
+                hashed_password=hash_password(
+                    os.getenv("DEFAULT_ADMIN_PASSWORD", "AdminPass@2026!")
+                ),
+                business_name="Default Merchant (Seeded)",
+                role="ADMIN",
+                razorpay_key_id=os.getenv("RAZORPAY_KEY_ID"),
+                razorpay_key_secret=os.getenv("RAZORPAY_KEY_SECRET"),
+                gemini_api_key=os.getenv("GEMINI_API_KEY"),
+                auto_recovery_enabled=True,
             )
-            """
-        )
-
-        # Migrate existing DBs that lack the new columns
-        existing_cols = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(recovery_audit_log)").fetchall()
-        }
-        new_cols = {
-            "customer_phone":       "TEXT    NOT NULL DEFAULT ''",
-            "customer_name":        "TEXT    NOT NULL DEFAULT ''",
-            "customer_email":       "TEXT    NOT NULL DEFAULT ''",
-            "retry_at":             "TEXT",
-            "retry_count":          "INTEGER NOT NULL DEFAULT 0",
-            "cooldown_seconds":     "INTEGER NOT NULL DEFAULT 0",
-            "notification_sent":    "INTEGER NOT NULL DEFAULT 0",
-            "notification_channel": "TEXT",
-            "notification_status":  "TEXT",
-        }
-        for col, defn in new_cols.items():
-            if col not in existing_cols:
-                conn.execute(f"ALTER TABLE recovery_audit_log ADD COLUMN {col} {defn}")
-
-        # Index for idempotency look-ups
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_order_id ON recovery_audit_log (order_id)"
-        )
-        # Index for scheduler polling
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_status_retry ON recovery_audit_log (status, retry_at)"
-        )
-
-        # Notifications receipt table
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS recovery_notifications (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id         TEXT    NOT NULL,
-                customer_phone   TEXT    NOT NULL,
-                channel          TEXT    NOT NULL,
-                message_preview  TEXT,
-                payment_link_url TEXT,
-                delivery_status  TEXT    NOT NULL DEFAULT 'QUEUED',
-                provider_ref     TEXT,
-                sent_at          TEXT    NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_notif_phone ON recovery_notifications (customer_phone, sent_at)"
-        )
+            db.add(default_admin)
+            db.commit()
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
-# Write helpers
+# CRUD helpers — Auth
 # ---------------------------------------------------------------------------
+def get_user_by_email(email: str) -> Optional[User]:
+    db = SessionLocal()
+    try:
+        return db.query(User).filter(User.email == email.lower()).first()
+    finally:
+        db.close()
+
+
+def get_user_by_id(user_id: str) -> Optional[User]:
+    db = SessionLocal()
+    try:
+        return db.query(User).filter(User.id == user_id).first()
+    finally:
+        db.close()
+
+
+def create_user(
+    email: str,
+    hashed_password: str,
+    business_name: str,
+    role: str = "ADMIN",
+    razorpay_key_id: Optional[str] = None,
+    razorpay_key_secret: Optional[str] = None,
+    gemini_api_key: Optional[str] = None,
+    parent_id: Optional[str] = None,
+) -> User:
+    db = SessionLocal()
+    try:
+        user = User(
+            email=email.lower(),
+            hashed_password=hashed_password,
+            business_name=business_name,
+            role=role,
+            razorpay_key_id=razorpay_key_id,
+            razorpay_key_secret=razorpay_key_secret,
+            gemini_api_key=gemini_api_key,
+            parent_id=parent_id,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# CRUD helpers — Refresh Tokens
+# ---------------------------------------------------------------------------
+def store_refresh_token(user_id: str, token_hash: str, expires_at: datetime) -> RefreshToken:
+    db = SessionLocal()
+    try:
+        rt = RefreshToken(user_id=user_id, token_hash=token_hash, expires_at=expires_at)
+        db.add(rt)
+        db.commit()
+        db.refresh(rt)
+        return rt
+    finally:
+        db.close()
+
+
+def get_refresh_token(token_hash: str) -> Optional[RefreshToken]:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(RefreshToken)
+            .filter(
+                RefreshToken.token_hash == token_hash,
+                RefreshToken.revoked == False,
+                RefreshToken.expires_at > datetime.now(timezone.utc),
+            )
+            .first()
+        )
+    finally:
+        db.close()
+
+
+def revoke_refresh_token(token_hash: str) -> None:
+    db = SessionLocal()
+    try:
+        rt = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
+        if rt:
+            rt.revoked = True
+            db.commit()
+    finally:
+        db.close()
+
+
+def revoke_all_refresh_tokens(user_id: str) -> None:
+    """Revoke all tokens for a user (e.g. password change or security event)."""
+    db = SessionLocal()
+    try:
+        db.query(RefreshToken).filter(RefreshToken.user_id == user_id).update({"revoked": True})
+        db.commit()
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# CRUD helpers — API Keys
+# ---------------------------------------------------------------------------
+def create_api_key(
+    user_id: str,
+    label: str,
+    raw_key: str,
+    key_hash: str,
+    expires_at: Optional[datetime] = None,
+) -> ApiKey:
+    db = SessionLocal()
+    try:
+        api_key = ApiKey(
+            user_id=user_id,
+            label=label,
+            key_prefix=raw_key[:16],
+            key_hash=key_hash,
+            expires_at=expires_at,
+        )
+        db.add(api_key)
+        db.commit()
+        db.refresh(api_key)
+        return api_key
+    finally:
+        db.close()
+
+
+def list_api_keys(user_id: str) -> list[ApiKey]:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(ApiKey)
+            .filter(ApiKey.user_id == user_id)
+            .order_by(ApiKey.created_at.desc())
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def get_api_key(key_id: str, user_id: str) -> Optional[ApiKey]:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(ApiKey)
+            .filter(ApiKey.id == key_id, ApiKey.user_id == user_id)
+            .first()
+        )
+    finally:
+        db.close()
+
+
+def revoke_api_key(key_id: str, user_id: str) -> bool:
+    db = SessionLocal()
+    try:
+        key = db.query(ApiKey).filter(
+            ApiKey.id == key_id, ApiKey.user_id == user_id
+        ).first()
+        if not key:
+            return False
+        key.is_active = False
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Legacy Recovery Pipeline helpers (unchanged interface)
+# ---------------------------------------------------------------------------
+def is_order_active_or_resolved(order_id: str, merchant_id: str = "default_merchant") -> bool:
+    db = SessionLocal()
+    try:
+        res = (
+            db.query(RecoveryAuditLog.id)
+            .filter(
+                RecoveryAuditLog.order_id == order_id,
+                RecoveryAuditLog.merchant_id == merchant_id,
+            )
+            .first()
+        )
+        return res is not None
+    finally:
+        db.close()
+
+
+# Alias
+is_order_locked_or_resolved = is_order_active_or_resolved
+
 
 def log_recovery(
     event: FailedPaymentEvent,
     ai_strategy: str,
     final_action: str,
     overridden: bool,
-    override_reason: str | None,
-    payment_link_url: str | None,
-    status: str,
-    cooldown_seconds: int = 0,
+    override_reason: Optional[str] = None,
+    payment_link_url: Optional[str] = None,
+    status: str = "RECOVERED_PENDING_PAYMENT",
+    merchant_id: str = "default_merchant",
+    nudge_sent: Optional[str] = None,
+    link: Optional[str] = None,
+    **kwargs,
 ) -> None:
-    now = _utcnow()
-    retry_at: str | None = None
-    if status == "SCHEDULED_RETRY" and cooldown_seconds > 0:
-        retry_at = (
-            datetime.datetime.utcnow()
-            + datetime.timedelta(seconds=cooldown_seconds)
-        ).isoformat(timespec="seconds") + "Z"
-
-    with _get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO recovery_audit_log
-                (order_id, payment_id, amount_paise, error_code, customer_tier,
-                 customer_phone, customer_name, customer_email,
-                 attempts, ai_strategy, final_action, guardrail_override,
-                 override_reason, payment_link_url, status,
-                 retry_at, cooldown_seconds, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.order_id, event.payment_id, event.amount, event.error_code,
-                event.customer_tier, event.customer_phone, event.customer_name,
-                event.customer_email, event.attempts_made, ai_strategy, final_action,
-                1 if overridden else 0, override_reason, payment_link_url, status,
-                retry_at, cooldown_seconds, now,
-            ),
+    db = SessionLocal()
+    try:
+        entry = RecoveryAuditLog(
+            merchant_id=merchant_id,
+            order_id=event.order_id,
+            payment_id=event.payment_id,
+            amount_paise=event.amount,
+            error_code=event.error_code,
+            customer_name=event.customer_name,
+            customer_phone=event.customer_phone,
+            customer_tier=event.customer_tier,
+            attempts=event.attempts_made,
+            ai_strategy=ai_strategy,
+            final_action=final_action,
+            guardrail_override=overridden,
+            override_reason=override_reason,
+            status=status,
+            payment_link=payment_link_url or link,
+            nudge_message_sent=nudge_sent,
         )
+        db.add(entry)
+        db.commit()
+    finally:
+        db.close()
 
 
-def update_notification_status(
-    order_id: str,
-    sent: bool,
-    channel: str | None,
-    notif_status: str,
-) -> None:
-    with _get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE recovery_audit_log
-            SET notification_sent = ?,
-                notification_channel = ?,
-                notification_status  = ?
-            WHERE order_id = ?
-            """,
-            (1 if sent else 0, channel, notif_status, order_id),
+def get_metrics(merchant_id: Optional[str] = None) -> dict:
+    db = SessionLocal()
+    try:
+        q = db.query(RecoveryAuditLog)
+        if merchant_id:
+            q = q.filter(RecoveryAuditLog.merchant_id == merchant_id)
+
+        total_events = q.count()
+        total_paise = q.with_entities(func.coalesce(func.sum(RecoveryAuditLog.amount_paise), 0)).scalar() or 0
+        recovered_paise = (
+            q.filter(RecoveryAuditLog.status == "RECOVERED_PENDING_PAYMENT")
+            .with_entities(func.coalesce(func.sum(RecoveryAuditLog.amount_paise), 0))
+            .scalar() or 0
         )
-
-
-def mark_retry_dispatched(order_id: str, new_status: str) -> None:
-    with _get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE recovery_audit_log
-            SET status      = ?,
-                retry_count = retry_count + 1,
-                retry_at    = NULL
-            WHERE order_id = ?
-            """,
-            (new_status, order_id),
+        scheduled_paise = (
+            q.filter(RecoveryAuditLog.status == "SCHEDULED_RETRY")
+            .with_entities(func.coalesce(func.sum(RecoveryAuditLog.amount_paise), 0))
+            .scalar() or 0
         )
-
-
-def log_notification(
-    order_id: str,
-    phone: str,
-    channel: str,
-    message_preview: str,
-    payment_link_url: str | None,
-    delivery_status: str,
-    provider_ref: str | None = None,
-) -> None:
-    with _get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO recovery_notifications
-                (order_id, customer_phone, channel, message_preview,
-                 payment_link_url, delivery_status, provider_ref, sent_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                order_id, phone, channel, message_preview[:200],
-                payment_link_url, delivery_status, provider_ref, _utcnow(),
-            ),
+        aborted_paise = (
+            q.filter(RecoveryAuditLog.status == "ABORTED")
+            .with_entities(func.coalesce(func.sum(RecoveryAuditLog.amount_paise), 0))
+            .scalar() or 0
         )
+        override_count = q.filter(RecoveryAuditLog.guardrail_override == True).count()
+        success_count = q.filter(
+            RecoveryAuditLog.status.in_(["RECOVERED_PENDING_PAYMENT", "SCHEDULED_RETRY"])
+        ).count()
+        recovery_rate = round((success_count / total_events * 100), 2) if total_events else 0.0
 
-
-# ---------------------------------------------------------------------------
-# Idempotency guard
-# ---------------------------------------------------------------------------
-
-def is_order_active_or_resolved(order_id: str) -> bool:
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT id FROM recovery_audit_log WHERE order_id = ? LIMIT 1",
-            (order_id,),
-        ).fetchone()
-    return row is not None
-
-
-# ---------------------------------------------------------------------------
-# Scheduler helpers
-# ---------------------------------------------------------------------------
-
-def get_pending_retries(now_iso: str) -> list[dict]:
-    """
-    Return all SCHEDULED_RETRY rows whose retry_at timestamp is <= now.
-    These are ready to be re-dispatched by the background scheduler.
-    """
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                order_id, payment_id, amount_paise, error_code,
-                customer_tier, customer_phone, customer_name, customer_email,
-                attempts, retry_count, cooldown_seconds
-            FROM recovery_audit_log
-            WHERE status = 'SCHEDULED_RETRY'
-              AND retry_at IS NOT NULL
-              AND retry_at <= ?
-            ORDER BY retry_at ASC
-            LIMIT 50
-            """,
-            (now_iso,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Notification rate-limit helper
-# ---------------------------------------------------------------------------
-
-def get_notification_count_last_24h(phone: str) -> int:
-    cutoff = (
-        datetime.datetime.utcnow() - datetime.timedelta(hours=24)
-    ).isoformat(timespec="seconds") + "Z"
-    with _get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM recovery_notifications
-            WHERE customer_phone = ? AND sent_at >= ?
-            """,
-            (phone, cutoff),
-        ).fetchone()
-    return row["cnt"] if row else 0
-
-
-# ---------------------------------------------------------------------------
-# Payment success confirmation
-# ---------------------------------------------------------------------------
-
-def mark_order_fully_recovered(order_id: str) -> bool:
-    """
-    Mark an order as FULLY_RECOVERED when Razorpay fires payment.captured.
-    Returns True if the row was found and updated.
-    """
-    with _get_conn() as conn:
-        cur = conn.execute(
-            """
-            UPDATE recovery_audit_log
-            SET status = 'FULLY_RECOVERED'
-            WHERE order_id = ?
-              AND status IN ('RECOVERED_PENDING_PAYMENT', 'SCHEDULED_RETRY')
-            """,
-            (order_id,),
-        )
-    return cur.rowcount > 0
-
-
-# ---------------------------------------------------------------------------
-# Read helpers
-# ---------------------------------------------------------------------------
-
-def get_metrics() -> dict:
-    with _get_conn() as conn:
-        total_row = conn.execute(
-            "SELECT COUNT(*) AS cnt, SUM(amount_paise) AS total FROM recovery_audit_log"
-        ).fetchone()
-        recovered_row = conn.execute(
-            "SELECT SUM(amount_paise) AS s FROM recovery_audit_log WHERE status = 'RECOVERED_PENDING_PAYMENT'"
-        ).fetchone()
-        fully_row = conn.execute(
-            "SELECT SUM(amount_paise) AS s FROM recovery_audit_log WHERE status = 'FULLY_RECOVERED'"
-        ).fetchone()
-        scheduled_row = conn.execute(
-            "SELECT SUM(amount_paise) AS s FROM recovery_audit_log WHERE status = 'SCHEDULED_RETRY'"
-        ).fetchone()
-        aborted_row = conn.execute(
-            "SELECT SUM(amount_paise) AS s FROM recovery_audit_log WHERE status = 'ABORTED'"
-        ).fetchone()
-        override_row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM recovery_audit_log WHERE guardrail_override = 1"
-        ).fetchone()
-        success_count_row = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt FROM recovery_audit_log
-            WHERE status IN ('RECOVERED_PENDING_PAYMENT', 'SCHEDULED_RETRY', 'FULLY_RECOVERED')
-            """
-        ).fetchone()
-        notif_row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM recovery_notifications"
-        ).fetchone()
-
-    total_events = total_row["cnt"] or 0
-    total_paise  = total_row["total"] or 0
-    success_count = success_count_row["cnt"] or 0
-    recovery_rate = round(success_count / total_events * 100, 2) if total_events else 0.0
-
-    return {
-        "total_events_processed":        total_events,
-        "total_gmv_at_risk_inr":         paise_to_rupees(total_paise),
-        "total_gmv_recovered_inr":       paise_to_rupees(recovered_row["s"] or 0),
-        "total_gmv_fully_recovered_inr": paise_to_rupees(fully_row["s"] or 0),
-        "total_gmv_scheduled_inr":       paise_to_rupees(scheduled_row["s"] or 0),
-        "total_gmv_aborted_inr":         paise_to_rupees(aborted_row["s"] or 0),
-        "guardrail_override_count":      override_row["cnt"] or 0,
-        "total_notifications_sent":      notif_row["cnt"] or 0,
-        "recovery_success_rate_pct":     recovery_rate,
-    }
-
-
-def get_recent_logs(limit: int = 20) -> list[dict]:
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, order_id, payment_id, amount_paise, error_code,
-                   customer_tier, customer_name, attempts, ai_strategy,
-                   final_action, guardrail_override, override_reason,
-                   payment_link_url, status, retry_at, retry_count,
-                   notification_sent, notification_channel, notification_status,
-                   created_at
-            FROM recovery_audit_log
-            ORDER BY id DESC LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [
-        {
-            "id":                   r["id"],
-            "order_id":             r["order_id"],
-            "payment_id":           r["payment_id"],
-            "amount_inr":           paise_to_rupees(r["amount_paise"]),
-            "error_code":           r["error_code"],
-            "customer_tier":        r["customer_tier"],
-            "customer_name":        r["customer_name"],
-            "attempts":             r["attempts"],
-            "ai_strategy":          r["ai_strategy"],
-            "final_action":         r["final_action"],
-            "guardrail_overridden": bool(r["guardrail_override"]),
-            "override_reason":      r["override_reason"],
-            "payment_link_url":     r["payment_link_url"],
-            "status":               r["status"],
-            "retry_at":             r["retry_at"],
-            "retry_count":          r["retry_count"],
-            "notification_sent":    bool(r["notification_sent"]),
-            "notification_channel": r["notification_channel"],
-            "notification_status":  r["notification_status"],
-            "created_at":           r["created_at"],
+        return {
+            "total_events_processed": total_events,
+            "total_gmv_at_risk_inr": paise_to_inr(total_paise),
+            "total_gmv_recovered_inr": paise_to_inr(recovered_paise),
+            "total_gmv_recovering_inr": paise_to_inr(recovered_paise),
+            "total_gmv_scheduled_inr": paise_to_inr(scheduled_paise),
+            "total_gmv_aborted_inr": paise_to_inr(aborted_paise),
+            "guardrail_override_count": override_count,
+            "guardrail_overrides": override_count,
+            "recovery_success_rate_pct": recovery_rate,
         }
-        for r in rows
-    ]
+    finally:
+        db.close()
 
 
-def get_notification_logs(limit: int = 50) -> list[dict]:
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, order_id, customer_phone, channel, message_preview,
-                   payment_link_url, delivery_status, provider_ref, sent_at
-            FROM recovery_notifications
-            ORDER BY id DESC LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+def get_recent_logs(limit: int = 20, merchant_id: Optional[str] = None) -> list[dict]:
+    db = SessionLocal()
+    try:
+        q = db.query(RecoveryAuditLog)
+        if merchant_id:
+            q = q.filter(RecoveryAuditLog.merchant_id == merchant_id)
+        rows = q.order_by(RecoveryAuditLog.id.desc()).limit(limit).all()
+        return [
+            {
+                "id": r.id,
+                "merchant_id": r.merchant_id,
+                "order_id": r.order_id,
+                "payment_id": r.payment_id,
+                "amount_inr": paise_to_inr(r.amount_paise),
+                "error_code": r.error_code,
+                "customer_name": r.customer_name,
+                "customer_phone": r.customer_phone,
+                "customer_tier": r.customer_tier,
+                "attempts": r.attempts,
+                "ai_strategy": r.ai_strategy,
+                "final_action": r.final_action,
+                "guardrail_overridden": r.guardrail_override,
+                "override_reason": r.override_reason,
+                "payment_link_url": r.payment_link,
+                "status": r.status,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
 
 
-# ---------------------------------------------------------------------------
-# Analytics helpers  (used by analytics.py)
-# ---------------------------------------------------------------------------
-
-def get_breakdown_by_error_code() -> list[dict]:
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT error_code,
-                   COUNT(*) AS count,
-                   SUM(amount_paise) AS total_paise,
-                   SUM(CASE WHEN status IN ('RECOVERED_PENDING_PAYMENT','FULLY_RECOVERED') THEN amount_paise ELSE 0 END) AS recovered_paise,
-                   SUM(CASE WHEN status = 'ABORTED' THEN 1 ELSE 0 END) AS aborted_count
-            FROM recovery_audit_log
-            GROUP BY error_code
-            ORDER BY total_paise DESC
-            """
-        ).fetchall()
-    return [
-        {
-            "error_code":         r["error_code"],
-            "count":              r["count"],
-            "total_gmv_inr":      paise_to_rupees(r["total_paise"] or 0),
-            "recovered_gmv_inr":  paise_to_rupees(r["recovered_paise"] or 0),
-            "aborted_count":      r["aborted_count"],
-        }
-        for r in rows
-    ]
-
-
-def get_breakdown_by_strategy() -> list[dict]:
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT ai_strategy,
-                   COUNT(*) AS count,
-                   SUM(amount_paise) AS total_paise,
-                   COUNT(CASE WHEN guardrail_override = 1 THEN 1 END) AS guardrail_overrides
-            FROM recovery_audit_log
-            GROUP BY ai_strategy
-            ORDER BY count DESC
-            """
-        ).fetchall()
-    return [
-        {
-            "strategy":           r["ai_strategy"],
-            "count":              r["count"],
-            "total_gmv_inr":      paise_to_rupees(r["total_paise"] or 0),
-            "guardrail_overrides": r["guardrail_overrides"],
-        }
-        for r in rows
-    ]
-
-
-def get_breakdown_by_tier() -> list[dict]:
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT customer_tier,
-                   COUNT(*) AS count,
-                   SUM(amount_paise) AS total_paise,
-                   SUM(CASE WHEN status IN ('RECOVERED_PENDING_PAYMENT','FULLY_RECOVERED') THEN amount_paise ELSE 0 END) AS recovered_paise,
-                   ROUND(AVG(attempts), 2) AS avg_attempts
-            FROM recovery_audit_log
-            GROUP BY customer_tier
-            ORDER BY total_paise DESC
-            """
-        ).fetchall()
-    return [
-        {
-            "customer_tier":     r["customer_tier"],
-            "count":             r["count"],
-            "total_gmv_inr":     paise_to_rupees(r["total_paise"] or 0),
-            "recovered_gmv_inr": paise_to_rupees(r["recovered_paise"] or 0),
-            "avg_attempts":      r["avg_attempts"],
-        }
-        for r in rows
-    ]
-
-
-def get_hourly_events(hours: int = 24) -> list[dict]:
-    cutoff = (
-        datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
-    ).isoformat(timespec="seconds") + "Z"
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT strftime('%Y-%m-%dT%H:00:00Z', created_at) AS hour,
-                   COUNT(*) AS event_count,
-                   SUM(amount_paise) AS gmv_paise
-            FROM recovery_audit_log
-            WHERE created_at >= ?
-            GROUP BY hour
-            ORDER BY hour ASC
-            """,
-            (cutoff,),
-        ).fetchall()
-    return [
-        {
-            "hour":        r["hour"],
-            "event_count": r["event_count"],
-            "gmv_inr":     paise_to_rupees(r["gmv_paise"] or 0),
-        }
-        for r in rows
-    ]
-
-
-def get_guardrail_breakdown() -> list[dict]:
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT override_reason,
-                   COUNT(*) AS count,
-                   SUM(amount_paise) AS total_paise
-            FROM recovery_audit_log
-            WHERE guardrail_override = 1
-              AND override_reason IS NOT NULL
-            GROUP BY override_reason
-            ORDER BY count DESC
-            """
-        ).fetchall()
-    return [
-        {
-            "rule":          r["override_reason"],
-            "count":         r["count"],
-            "gmv_affected_inr": paise_to_rupees(r["total_paise"] or 0),
-        }
-        for r in rows
-    ]
-
-
-def get_customer_profile(phone: str) -> dict:
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT order_id, amount_paise, error_code, customer_tier,
-                   customer_name, ai_strategy, status, created_at
-            FROM recovery_audit_log
-            WHERE customer_phone = ?
-            ORDER BY created_at DESC
-            """,
-            (phone,),
-        ).fetchall()
-    if not rows:
-        return {}
-    events = [dict(r) for r in rows]
-    total_paise = sum(r["amount_paise"] for r in events)
-    recovered = sum(
-        r["amount_paise"] for r in events
-        if r["status"] in ("RECOVERED_PENDING_PAYMENT", "FULLY_RECOVERED")
-    )
-    return {
-        "customer_name":     events[0]["customer_name"],
-        "customer_tier":     events[0]["customer_tier"],
-        "total_events":      len(events),
-        "total_gmv_inr":     paise_to_rupees(total_paise),
-        "recovered_gmv_inr": paise_to_rupees(recovered),
-        "recovery_rate_pct": round(recovered / total_paise * 100, 1) if total_paise else 0.0,
-        "recent_events":     events[:10],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _utcnow() -> str:
-    return datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+def reset_db(merchant_id: Optional[str] = None) -> None:
+    db = SessionLocal()
+    try:
+        if merchant_id:
+            db.query(RecoveryAuditLog).filter(
+                RecoveryAuditLog.merchant_id == merchant_id
+            ).delete()
+        else:
+            db.query(RecoveryAuditLog).delete()
+        db.commit()
+    finally:
+        db.close()

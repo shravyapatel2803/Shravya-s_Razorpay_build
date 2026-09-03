@@ -1,4 +1,4 @@
-﻿"""
+"""
 guardrails.py — Deterministic, non-negotiable fintech business rules.
 
 The guardrail engine sits BETWEEN the LLM output and execution.  It is the
@@ -108,19 +108,19 @@ def enforce_guardrails(
             override_reasons.append(msg)
 
     # -----------------------------------------------------------------------
-    # Rule 3 — High-Value Channel Security
-    # SMS is susceptible to spoofing / SIM-swap attacks.  For transactions
-    # above Rs.50,000, mandate WhatsApp which provides richer, verified UI
-    # and end-to-end encryption.
+    # Rule 3 — High-Value Transaction Verification Guard
+    # For transactions above Rs.50,000, ensure channel is verified and not NONE
+    # when dynamic payment links are dispatched.
     # -----------------------------------------------------------------------
     if (
         event.amount > HIGH_VALUE_THRESHOLD_PAISE
-        and final_plan.recommended_channel == "SMS"
+        and final_plan.recommended_strategy == "DISPATCH_DYNAMIC_PAYMENT_LINK"
+        and final_plan.recommended_channel == "NONE"
     ):
-        final_plan.recommended_channel = "WHATSAPP"
+        final_plan.recommended_channel = "SMS"
         msg = (
             f"[Rule 3] High-value order (Rs.{event.amount / 100:,.0f}): "
-            f"SMS channel overridden to WHATSAPP (anti-spoofing policy)."
+            f"Recovery channel mandated for high-ticket transaction."
         )
         logger.warning(msg)
         override_reasons.append(msg)

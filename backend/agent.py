@@ -1,4 +1,4 @@
-﻿"""
+"""
 agent.py — Gemini-powered structured policy engine.
 
 Uses the official google-genai SDK to call gemini-3.5-flash with a strict
@@ -73,7 +73,7 @@ precise, actionable recovery policy in the exact JSON schema provided.
 1. GATEWAY_TECHNICAL_FAILURE → prefer SILENT_BACKGROUND_RETRY with 300–900s cooldown.
    Do NOT contact the customer; the failure is not their fault.
 
-2. CUSTOMER_BALANCE_DEFICIT → prefer DISPATCH_DYNAMIC_PAYMENT_LINK via WhatsApp or SMS
+2. CUSTOMER_BALANCE_DEFICIT → prefer DISPATCH_DYNAMIC_PAYMENT_LINK via SMS
    with an empathetic Hinglish message. Nudge gently, only once.
 
 3. AUTHENTICATION_ABANDONMENT → prefer DISPATCH_DYNAMIC_PAYMENT_LINK.
@@ -84,7 +84,7 @@ precise, actionable recovery policy in the exact JSON schema provided.
 
 5. If attempts_made >= 3 → always recommend HALT_AND_ABORT regardless of cause.
 
-6. VIP customers deserve a WhatsApp nudge with a premium-feel message.
+6. VIP customers receive a premium-feel message.
    REPEAT_DROPOFF customers need a slightly more persuasive tone.
 
 ## AMOUNT RULES
@@ -266,9 +266,9 @@ def _deterministic_fallback(event: FailedPaymentEvent) -> LLMRecoveryPlan:
     # --- Select strategy ---
     if event.attempts_made >= 3:
         return LLMRecoveryPlan(
-            root_cause_classification=cause,
-            recommended_strategy="HALT_AND_ABORT",
-            recommended_channel="NONE",
+            root_cause=cause, root_cause_classification=cause,
+            strategy="HALT_AND_ABORT", recommended_strategy="HALT_AND_ABORT",
+            channel="NONE", recommended_channel="NONE",
             cooldown_seconds=0,
             confidence_score=0.99,
             nudge_message="",
@@ -280,9 +280,9 @@ def _deterministic_fallback(event: FailedPaymentEvent) -> LLMRecoveryPlan:
 
     if cause == "GATEWAY_TECHNICAL_FAILURE":
         return LLMRecoveryPlan(
-            root_cause_classification=cause,
-            recommended_strategy="SILENT_BACKGROUND_RETRY",
-            recommended_channel="NONE",
+            root_cause=cause, root_cause_classification=cause,
+            strategy="SILENT_BACKGROUND_RETRY", recommended_strategy="SILENT_BACKGROUND_RETRY",
+            channel="NONE", recommended_channel="NONE",
             cooldown_seconds=600,
             confidence_score=0.92,
             nudge_message="",
@@ -294,9 +294,9 @@ def _deterministic_fallback(event: FailedPaymentEvent) -> LLMRecoveryPlan:
 
     if cause == "SUSPECTED_RISK":
         return LLMRecoveryPlan(
-            root_cause_classification=cause,
-            recommended_strategy="HALT_AND_ABORT",
-            recommended_channel="NONE",
+            root_cause=cause, root_cause_classification=cause,
+            strategy="HALT_AND_ABORT", recommended_strategy="HALT_AND_ABORT",
+            channel="NONE", recommended_channel="NONE",
             cooldown_seconds=0,
             confidence_score=0.97,
             nudge_message="",
@@ -309,7 +309,7 @@ def _deterministic_fallback(event: FailedPaymentEvent) -> LLMRecoveryPlan:
     # Customer balance deficit or authentication abandonment → dispatch link
     first_name = event.customer_name.split()[0] if event.customer_name else "Customer"
     amount_inr = int(event.amount / 100)
-    channel = "WHATSAPP" if event.customer_tier == "VIP" else "SMS"
+    channel = "SMS"
 
     if cause == "AUTHENTICATION_ABANDONMENT":
         nudge = (
@@ -325,9 +325,9 @@ def _deterministic_fallback(event: FailedPaymentEvent) -> LLMRecoveryPlan:
         cooldown = 300
 
     return LLMRecoveryPlan(
-        root_cause_classification=cause,
-        recommended_strategy="DISPATCH_DYNAMIC_PAYMENT_LINK",
-        recommended_channel=channel,
+        root_cause=cause, root_cause_classification=cause,
+        strategy="DISPATCH_DYNAMIC_PAYMENT_LINK", recommended_strategy="DISPATCH_DYNAMIC_PAYMENT_LINK",
+        channel=channel, recommended_channel=channel,
         cooldown_seconds=cooldown,
         confidence_score=0.85,
         nudge_message=nudge,
@@ -336,3 +336,7 @@ def _deterministic_fallback(event: FailedPaymentEvent) -> LLMRecoveryPlan:
             f"Dispatching payment link via {channel}."
         ),
     )
+
+
+def is_live() -> bool:
+    return _genai_client is not None
