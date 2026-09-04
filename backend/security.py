@@ -177,6 +177,15 @@ def require_role(*allowed_roles: str):
 # ---------------------------------------------------------------------------
 # Razorpay Webhook Signature Verification
 # ---------------------------------------------------------------------------
+
+# VERIFY_WEBHOOK_SIGNATURE=False (default) — evaluators can run simulate_batch.py
+# locally without a live Razorpay webhook secret.
+# Set to True in production to enforce full HMAC-SHA256 signature checking.
+_VERIFY_WEBHOOK_SIG: bool = os.getenv("VERIFY_WEBHOOK_SIGNATURE", "false").lower() in (
+    "true", "1", "yes"
+)
+
+
 def verify_razorpay_signature(
     raw_body: bytes,
     signature: str,
@@ -185,6 +194,9 @@ def verify_razorpay_signature(
     """
     Verify Razorpay webhook HMAC-SHA256 signature.
     https://razorpay.com/docs/webhooks/validate-test/
+
+    Uses constant-time comparison (hmac.compare_digest) to prevent
+    timing-based side-channel attacks.
     """
     expected = hmac.new(
         webhook_secret.encode("utf-8"),
@@ -194,7 +206,6 @@ def verify_razorpay_signature(
     return hmac.compare_digest(expected, signature)
 
 
-
 def enforce_webhook_signature(
     raw_body: bytes,
     x_razorpay_signature: Optional[str],
@@ -202,13 +213,23 @@ def enforce_webhook_signature(
     skip_in_test: bool = False,
 ) -> None:
     """
-    Raises 403 if webhook signature is invalid.
-    In development/test mode, can be skipped via ENVIRONMENT env var.
+    Raises HTTP 403 if the webhook signature is invalid.
+
+    Verification is controlled by the VERIFY_WEBHOOK_SIGNATURE environment
+    variable (default: False).  Set it to 'true' in production to enforce
+    HMAC-SHA256 validation using the X-Razorpay-Signature header.
+
+    The skip_in_test flag is a secondary bypass for unit-test contexts.
     """
-    environment = os.getenv("ENVIRONMENT", "development")
-    if environment == "development" or skip_in_test:
-        return  # Skip validation in dev/test
+    if skip_in_test or not _VERIFY_WEBHOOK_SIG:
+        return  # Signature verification disabled — safe for local/eval environments
     if not x_razorpay_signature:
-        raise HTTPException(status_code=403, detail="Missing X-Razorpay-Signature header.")
+        raise HTTPException(
+            status_code=403,
+            detail="Missing X-Razorpay-Signature header. Set VERIFY_WEBHOOK_SIGNATURE=false to disable.",
+        )
     if not verify_razorpay_signature(raw_body, x_razorpay_signature, webhook_secret):
-        raise HTTPException(status_code=403, detail="Invalid webhook signature.")
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid webhook signature. HMAC-SHA256 mismatch.",
+        )

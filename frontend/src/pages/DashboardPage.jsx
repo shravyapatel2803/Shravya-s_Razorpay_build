@@ -5,7 +5,7 @@ import {
   Activity, RotateCcw, ChevronRight
 } from 'lucide-react'
 import { toast } from 'sonner'
-import KpiCard from '../components/KpiCard'
+import KpiCard, { NetMarginCard } from '../components/KpiCard'
 import RecoveryFunnel from '../components/RecoveryFunnel'
 import LiveFeed from '../components/LiveFeed'
 import { recoveryAPI } from '../api/client'
@@ -137,16 +137,22 @@ export default function DashboardPage() {
 
       {/* KPI Cards */}
       {loading ? (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-          {[...Array(4)].map((_, i) => (
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+          {[...Array(5)].map((_, i) => (
             <div key={i} className="card h-28 animate-pulse" style={{ background: 'var(--color-surface-2)' }} />
           ))}
         </div>
       ) : (
-        <div ref={kpiRef} className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <div ref={kpiRef} className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
           {kpis.map((kpi) => (
             <KpiCard key={kpi.label} {...kpi} />
           ))}
+          {metrics && (
+            <NetMarginCard
+              grossRecoveredInr={metrics.total_gmv_recovered_inr ?? 0}
+              nudgesDispatched={metrics.nudge_dispatched_count ?? 0}
+            />
+          )}
         </div>
       )}
 

@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from './store/authStore'
 import AuthPage from './pages/AuthPage'
+import CheckoutPage from './pages/CheckoutPage'
 import DashboardPage from './pages/DashboardPage'
 import WebhookPage from './pages/WebhookPage'
 import ApiKeysPage from './pages/ApiKeysPage'
@@ -16,6 +17,8 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<AuthPage />} />
+      <Route path="/pay/:linkId" element={<CheckoutPage />} />
+      <Route path="/pay" element={<CheckoutPage />} />
       <Route
         path="/*"
         element={

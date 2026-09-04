@@ -13,6 +13,11 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
+import threading
+import time
+from collections import defaultdict, deque
+from typing import Deque
 
 from models import FailedPaymentEvent, LLMRecoveryPlan
 
@@ -24,6 +29,105 @@ logger = logging.getLogger(__name__)
 MAX_RETRY_ATTEMPTS: int = 3          # Rule 1 — anti-fatigue ceiling
 TECHNICAL_MIN_COOLDOWN_S: int = 300  # Rule 2 — minimum cooldown for gateway failures
 HIGH_VALUE_THRESHOLD_PAISE: int = 5_000_000  # Rule 3 — Rs.50,000
+
+# ---------------------------------------------------------------------------
+# Rule 5 — Issuer Outage Circuit Breaker constants
+# ---------------------------------------------------------------------------
+CIRCUIT_BREAKER_WINDOW_S: int = 300        # 5-minute sliding window
+CIRCUIT_BREAKER_THRESHOLD: int = 3         # >3 failures trips the breaker
+CIRCUIT_BREAKER_COOLDOWN_S: int = 1_800    # 30-minute breaker cooldown
+
+# ---------------------------------------------------------------------------
+# Circuit Breaker State (in-memory, thread-safe)
+# Maps issuer_code -> deque of failure timestamps (float epoch seconds)
+# Maps issuer_code -> trip_timestamp (float epoch seconds) or None
+# ---------------------------------------------------------------------------
+_cb_lock = threading.Lock()
+_issuer_failure_times: dict[str, Deque[float]] = defaultdict(deque)
+_issuer_tripped_at: dict[str, float] = {}
+
+
+def _extract_issuer_code(error_code: str) -> str:
+    """
+    Derive a canonical issuer token from the raw error_code string.
+    Examples:
+      'GATEWAY_ERROR_BANK_SYSTEM_ERROR'  -> 'BANK_SYSTEM_ERROR'
+      'GATEWAY_ERROR_HDFC_SYSTEM_DOWN'   -> 'HDFC_SYSTEM_DOWN'
+      'BAD_REQUEST_PAYMENT_OTP_EXPIRED'  -> 'OTHER'
+    Only GATEWAY_ERROR_* codes contribute to the circuit breaker.
+    """
+    m = re.match(r"GATEWAY_ERROR_(.+)", error_code)
+    if m:
+        return m.group(1)
+    return "OTHER"
+
+
+def record_issuer_failure(error_code: str) -> None:
+    """
+    Record a failure for the issuer inferred from error_code.
+    Call this BEFORE enforce_guardrails so the counter is always current.
+    """
+    issuer = _extract_issuer_code(error_code)
+    if issuer == "OTHER":
+        return  # Only track gateway/issuer-level failures
+    now = time.monotonic()
+    with _cb_lock:
+        dq = _issuer_failure_times[issuer]
+        dq.append(now)
+        # Evict entries outside the sliding window
+        cutoff = now - CIRCUIT_BREAKER_WINDOW_S
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        # Trip the breaker if threshold exceeded and not already tripped
+        if len(dq) > CIRCUIT_BREAKER_THRESHOLD and issuer not in _issuer_tripped_at:
+            _issuer_tripped_at[issuer] = now
+            logger.warning(
+                "[CircuitBreaker] Issuer '%s' tripped — %d failures in %.0fs window. "
+                "Suppressing all notifications for %ds.",
+                issuer, len(dq), CIRCUIT_BREAKER_WINDOW_S, CIRCUIT_BREAKER_COOLDOWN_S,
+            )
+
+
+def is_circuit_open(error_code: str) -> bool:
+    """Return True if the circuit breaker is currently tripped for this issuer."""
+    issuer = _extract_issuer_code(error_code)
+    if issuer == "OTHER":
+        return False
+    now = time.monotonic()
+    with _cb_lock:
+        tripped_at = _issuer_tripped_at.get(issuer)
+        if tripped_at is None:
+            return False
+        if now - tripped_at >= CIRCUIT_BREAKER_COOLDOWN_S:
+            # Auto-reset after cooldown
+            del _issuer_tripped_at[issuer]
+            _issuer_failure_times[issuer].clear()
+            logger.info(
+                "[CircuitBreaker] Issuer '%s' recovered — circuit reset after %ds cooldown.",
+                issuer, CIRCUIT_BREAKER_COOLDOWN_S,
+            )
+            return False
+        return True
+
+
+def get_circuit_breaker_status() -> dict[str, dict]:
+    """
+    Return a snapshot of all issuer circuit breaker states.
+    Useful for health-check / admin endpoints.
+    """
+    now = time.monotonic()
+    with _cb_lock:
+        result = {}
+        for issuer, dq in _issuer_failure_times.items():
+            tripped_at = _issuer_tripped_at.get(issuer)
+            result[issuer] = {
+                "failures_in_window": len(dq),
+                "tripped": tripped_at is not None,
+                "cooldown_remaining_s": max(
+                    0, CIRCUIT_BREAKER_COOLDOWN_S - (now - tripped_at)
+                ) if tripped_at else 0,
+            }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +236,51 @@ def enforce_guardrails(
     # has gone deeply wrong upstream.
     # -----------------------------------------------------------------------
     # (No LLM field to mutate; this rule is enforced by schema design.)
+
+    # -----------------------------------------------------------------------
+    # Rule 5 — Issuer Outage Circuit Breaker
+    # If more than CIRCUIT_BREAKER_THRESHOLD transactions from the same issuer
+    # fail within CIRCUIT_BREAKER_WINDOW_S seconds, trip the circuit breaker
+    # for CIRCUIT_BREAKER_COOLDOWN_S seconds.  During this window, all events
+    # from the affected issuer are forced into SILENT_BACKGROUND_RETRY and all
+    # buyer notifications are suppressed.  This prevents burning merchant
+    # WhatsApp budget during bank-side outages (e.g. HDFC / SBI core banking
+    # downtime) and avoids frustrating buyers with messages they cannot act on.
+    # -----------------------------------------------------------------------
+    if is_circuit_open(event.error_code):
+        issuer = _extract_issuer_code(event.error_code)
+        parts_cb: list[str] = []
+        changed_cb = False
+
+        if final_plan.recommended_strategy not in (
+            "SILENT_BACKGROUND_RETRY",
+            "HALT_AND_ABORT",
+        ):
+            final_plan.recommended_strategy = "SILENT_BACKGROUND_RETRY"
+            parts_cb.append("strategy forced to SILENT_BACKGROUND_RETRY")
+            changed_cb = True
+
+        if final_plan.recommended_channel != "NONE":
+            final_plan.recommended_channel = "NONE"
+            final_plan.nudge_message = ""
+            parts_cb.append("buyer notification suppressed (issuer circuit open)")
+            changed_cb = True
+
+        if final_plan.cooldown_seconds < CIRCUIT_BREAKER_COOLDOWN_S:
+            final_plan.cooldown_seconds = CIRCUIT_BREAKER_COOLDOWN_S
+            parts_cb.append(
+                f"cooldown raised to {CIRCUIT_BREAKER_COOLDOWN_S}s (circuit breaker duration)"
+            )
+            changed_cb = True
+
+        if changed_cb:
+            msg = (
+                f"[Rule 5] Circuit breaker OPEN for issuer '{issuer}': "
+                f"{'; '.join(parts_cb)}. "
+                f"Bank outage detected — retrying silently for {CIRCUIT_BREAKER_COOLDOWN_S // 60}min."
+            )
+            logger.warning(msg)
+            override_reasons.append(msg)
 
     was_overridden = len(override_reasons) > 0
     override_reason: str | None = (

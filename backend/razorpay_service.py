@@ -1,4 +1,4 @@
-﻿"""
+"""
 razorpay_service.py — Razorpay API wrapper with authentic mock fallback.
 
 If RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are present the real SDK is used.
@@ -90,7 +90,7 @@ def create_recovery_payment_link(
     }
 
     if _MOCK_MODE:
-        return _mock_payment_link(order_id)
+        return _mock_payment_link(order_id, amount_paise)
 
     try:
         response = _rzp_client.payment_link.create(payload)
@@ -103,7 +103,7 @@ def create_recovery_payment_link(
             order_id,
             exc,
         )
-        return _mock_payment_link(order_id)
+        return _mock_payment_link(order_id, amount_paise)
 
 
 def get_payment_status(payment_id: str) -> dict:
@@ -129,10 +129,12 @@ def get_payment_status(payment_id: str) -> dict:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _mock_payment_link(order_id: str) -> str:
-    """Return a deterministic, visually authentic mock payment link."""
-    slug = order_id.replace("order_", "")[:8].lower()
-    return f"https://rzp.io/i/mock_{slug}"
+def _mock_payment_link(order_id: str, amount_paise: int = 0) -> str:
+    """Return a deterministic, visually authentic mock payment link routed to the recovery checkout sandbox."""
+    slug = order_id.replace("order_", "")[:12].lower()
+    frontend_base = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+    amount_inr = round(amount_paise / 100, 2)
+    return f"{frontend_base}/pay/mock_{slug}?order_id={order_id}&amount={amount_inr}"
 
 
 def is_mock_mode() -> bool:

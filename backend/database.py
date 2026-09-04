@@ -458,6 +458,7 @@ def get_metrics(merchant_id: Optional[str] = None) -> dict:
         success_count = q.filter(
             RecoveryAuditLog.status.in_(["RECOVERED_PENDING_PAYMENT", "SCHEDULED_RETRY"])
         ).count()
+        nudge_count = q.filter(RecoveryAuditLog.nudge_message_sent.isnot(None)).count()
         recovery_rate = round((success_count / total_events * 100), 2) if total_events else 0.0
 
         return {
@@ -469,6 +470,7 @@ def get_metrics(merchant_id: Optional[str] = None) -> dict:
             "total_gmv_aborted_inr": paise_to_inr(aborted_paise),
             "guardrail_override_count": override_count,
             "guardrail_overrides": override_count,
+            "nudge_dispatched_count": nudge_count,
             "recovery_success_rate_pct": recovery_rate,
         }
     finally:
@@ -499,6 +501,7 @@ def get_recent_logs(limit: int = 20, merchant_id: Optional[str] = None) -> list[
                 "guardrail_overridden": r.guardrail_override,
                 "override_reason": r.override_reason,
                 "payment_link_url": r.payment_link,
+                "nudge_message_sent": r.nudge_message_sent,
                 "status": r.status,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }

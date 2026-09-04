@@ -13,6 +13,7 @@ Features:
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -36,7 +37,7 @@ from auth import router as auth_router
 from api_keys import router as api_keys_router
 from models import ExecutionResult, FailedPaymentEvent, paise_to_rupees
 from rate_limiter import limiter
-from security import get_current_merchant, require_role
+from security import get_current_merchant, require_role, enforce_webhook_signature
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,6 +197,16 @@ async def handle_payment_failed(
 ) -> ExecutionResult:
     merchant_id = merchant["merchant_id"]
 
+    # 0. Webhook Signature Verification (HMAC-SHA256)
+    # Reads the raw body bytes for signature validation.
+    # Verification is skipped unless VERIFY_WEBHOOK_SIGNATURE=true in .env
+    raw_body = await request.body()
+    enforce_webhook_signature(
+        raw_body=raw_body,
+        x_razorpay_signature=x_razorpay_signature,
+        webhook_secret=os.getenv("RAZORPAY_WEBHOOK_SECRET", ""),
+    )
+
     logger.info(
         "PIPELINE START | merchant=%s | order=%s | amount=Rs.%.2f | error=%s | role=%s",
         merchant_id, event.order_id, event.amount / 100, event.error_code, merchant["role"],
@@ -214,7 +225,8 @@ async def handle_payment_failed(
     ai_strategy = getattr(llm_plan, "strategy", None) or getattr(llm_plan, "recommended_strategy", "DISPATCH_DYNAMIC_PAYMENT_LINK")
     nudge_text = getattr(llm_plan, "nudge_message", "")
 
-    # 3. Deterministic Guardrails
+    # 3. Deterministic Guardrails (record issuer failure first for circuit breaker)
+    guardrails.record_issuer_failure(event.error_code)
     final_plan, overridden, override_reason = guardrails.enforce_guardrails(event, llm_plan)
     final_strategy = getattr(final_plan, "strategy", None) or getattr(final_plan, "recommended_strategy", ai_strategy)
     final_cooldown = getattr(final_plan, "cooldown_seconds", 0)
@@ -303,6 +315,21 @@ async def reset_audit(
 ) -> dict:
     database.reset_db(merchant_id=merchant["merchant_id"])
     return {"status": "success", "message": f"Audit ledger reset for merchant {merchant['merchant_id']}."}
+
+
+@app.get("/audit/circuit-breaker", tags=["Audit"])
+async def get_circuit_breaker_status(
+    merchant: dict = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+) -> dict:
+    """Return the current state of the issuer outage circuit breaker."""
+    return {
+        "config": {
+            "window_seconds": guardrails.CIRCUIT_BREAKER_WINDOW_S,
+            "threshold": guardrails.CIRCUIT_BREAKER_THRESHOLD,
+            "cooldown_seconds": guardrails.CIRCUIT_BREAKER_COOLDOWN_S,
+        },
+        "issuers": guardrails.get_circuit_breaker_status(),
+    }
 
 
 if __name__ == "__main__":
